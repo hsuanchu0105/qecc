@@ -61,7 +61,7 @@ def create_random_sequential_circuit_dag(
     temp_reuse = []
     temp_noreuse = []
     for pair in layer_int_temp:
-        chosen = random.choice(pair)  # ruff:ignore[suspicious-non-cryptographic-random-usage]
+        chosen = rng.choice(pair) 
         temp_reuse.append(chosen)
         other = pair[0] if chosen == pair[1] else pair[1]
         temp_noreuse.append(other)
