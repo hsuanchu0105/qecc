@@ -18,6 +18,7 @@ import pickle  # ruff:ignore[suspicious-pickle-import]
 import random
 import sys
 import warnings
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any, cast
 
 import networkx as nx
@@ -26,7 +27,7 @@ import numpy as np
 import mqt.qecc.cococo.internal_testing as tst
 from mqt.qecc.cococo import dag_helper
 
-from .types import pos
+from .types import pos, Gate, FirstPart, RouteInfo
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -92,6 +93,21 @@ class BasicRouter:
             msg = "Other metrics than crossing and exact not implemented yet."  # pragma: no cover
             raise NotImplementedError(msg)
 
+        self.routes_by_layer: dict[int, dict[Gate, RouteInfo]] = defaultdict(dict)
+        self.overlap_graphs: dict[int, nx.Graph] = defaultdict(nx.Graph)
+        self.node_to_gates_by_layer: dict[int, dict[pos, set[Gate]]] = defaultdict(lambda: defaultdict(set))
+        self.fine_allowed_junctions: dict[Gate, set[pos]] | None = None
+
+    def default_ancilla_idx(self, path: list[pos]) -> int:
+        if len(path) < 3:
+            raise ValueError(f"Path too short for internal ancilla: {path}")
+        return len(path) // 2
+
+    
+    def build_route_info(self, gate: Gate, path: list[pos], ancilla_idx: int , first_part: FirstPart = "control",
+    ) -> RouteInfo:
+        return RouteInfo(gate=gate, path=tuple(path), ancilla_idx=ancilla_idx, first_part=first_part)
+    
     @staticmethod
     def path_sc(g: nx.Graph, control: pos, target: pos) -> list[pos]:
         """Find the shortest path with Dijkstra but with constraints for standard sc.
@@ -348,6 +364,239 @@ class BasicRouter:
 
         return vdp_dict, terminal_pairs_remainder, factory_times_temp
 
+    @staticmethod
+    def ancilla_region_bounds(path_len: int, blocks: list[dict], region: int) -> tuple[int, int]:
+        """
+        [lo, hi] range of ancilla indices for `region` of a path.
+
+        `region` == j means the ancilla sits between block j-1 and block j, so blocks
+        0..j-1 fall on the control side and blocks j..end on the target side. 
+        """
+        m = len(blocks)
+        lo = 1 if region == 0 else blocks[region - 1]["end"] + 1
+        hi = (path_len - 2) if region == m else blocks[region]["start"] - 1
+        return lo, hi
+
+    @staticmethod
+    def overlap_blocks(path: list[pos], other_paths: set[pos]) -> list[dict]:
+        """
+        Overlap blocks of `path` against `other_paths`.
+        """
+        blocks = []
+        start = None
+        for i in range(1, len(path) - 1):
+            if path[i] in other_paths:
+                if start is None:
+                    start = i          
+            elif start is not None: # end of this block 
+                blocks.append({"start": start, "end": i - 1})
+                start = None # reset the start for the next block 
+        if start is not None:   # last block
+            blocks.append({"start": start, "end": len(path) - 2})
+        return blocks
+    
+    def t_junction_bounds(self, route_info: RouteInfo, overlap_paths: set[pos]) -> tuple[int, int]:
+        """
+        [lo, hi] path-index range where a steiner T-junction may attach for a fine-grained route
+        for coarse-grained method, it degenerates to the whole interior [1, len-2].
+        """
+        path = list(route_info.path)
+        blocks = self.overlap_blocks(path, overlap_paths)
+        a_idx = route_info.ancilla_idx
+        assert all(a_idx < b["start"] or a_idx > b["end"] for b in blocks), (
+            f"Committed ancilla_idx {a_idx} lies inside an overlap block "
+            f"for gate {route_info.gate}."
+        )
+        region = sum(1 for b in blocks if b["end"] < a_idx)
+        lo, hi = self.ancilla_region_bounds(len(path), blocks, region)
+        assert lo <= a_idx <= hi, "internal error: ancilla outside its region bounds"
+        return lo, hi
+    
+
+    def direct_overlaps(self, layer_idx: int, route_info: RouteInfo) -> dict[Gate, set[pos]]:
+            """
+            Check which existing routes in this layer overlap with the candidate route.
+    
+            return dict{gate: set of overlapped nodes}
+            """
+            node_to_gates = self.node_to_gates_by_layer[layer_idx] # dict[pos, set[Gate]]
+            candidate_nodes = set(route_info.path)
+    
+            overlaps: dict[Gate, set[pos]] = defaultdict(set)
+            for node in candidate_nodes:
+                for other_gate in node_to_gates.get(node, set()):
+                    if other_gate == route_info.gate:
+                        continue
+                    overlaps[other_gate].add(node)
+    
+            return dict(overlaps)
+    
+    def local_overlap_graph(self, layer_idx: int, route_info: RouteInfo) -> nx.Graph:
+        """
+        Build the local overlap graph containing the candidate route.
+        """
+        #print("local overlap function check: ")
+        #print("Gate: ", route_info.gate)
+
+        G = self.overlap_graphs[layer_idx]
+        direct_overlaps = self.direct_overlaps(layer_idx, route_info) # dict[gate, overlap_nodes]
+        candidate_gate = route_info.gate
+        
+        if not direct_overlaps: # valid 
+            H = nx.Graph()
+            H.add_node(candidate_gate, route_info=route_info, is_candidate=True)
+            return H
+
+        # Collect existing connected components touched by this candidate.
+        affected_gates: set[Gate] = set()
+        for other_gate in direct_overlaps:
+            if G.has_node(other_gate):
+                affected_gates.update(nx.node_connected_component(G, other_gate))
+            else:
+                raise NotImplementedError(f"Gate {other_gate} not exists in the graph!")
+
+        H = G.subgraph(affected_gates).copy()  # copy only affected part
+        H.add_node(candidate_gate, route_info=route_info, is_candidate=True) # add candidate
+
+        # Add candidate overlap edges.
+        for other_gate, overlap_nodes in direct_overlaps.items():
+            H.add_edge(
+                candidate_gate,
+                other_gate,
+                overlap_nodes=set(overlap_nodes),
+                num_overlap=len(overlap_nodes),
+                is_candidate_edge=True,
+            )
+       
+        return H
+
+
+    def find_fine_grained_vdp(self,
+            layer_idx: int,
+            layer: list[tuple[pos, pos] | pos],
+            logical_pos: None | list[pos],
+            factory_times: dict[pos, int],
+            max_overlap: int = 5,
+        ) -> list[Gate]:
+            
+        paths_current_layer = [] 
+        gates_current_layer = layer.copy()
+        remainder_terminal_pairs = []
+        for gate in gates_current_layer:
+
+            g_temp = self.g.copy()
+
+            nodes_to_remove = [
+                x for x in (self.logical_pos if logical_pos is None else logical_pos)
+                if x != gate[0] and x != gate[1]
+            ]
+            g_temp.remove_nodes_from(nodes_to_remove)
+
+            try:
+                path = self.valid_path_method()(g_temp, gate[0], gate[1])
+            except nx.NetworkXNoPath:
+                remainder_terminal_pairs.append(gate)
+                continue
+            
+            route_info = self.build_route_info(gate, path, self.default_ancilla_idx(path), "control")
+            if paths_current_layer:
+                local_og = self.local_overlap_graph(layer_idx, route_info)
+                n = local_og.number_of_nodes()
+
+                if n == 1:
+                    # No overlap with any committed route in this layer.
+                    paths_current_layer.append(path)
+                    self.commit_route(layer_idx, route_info)
+                    continue
+
+                within_cap = n <= max_overlap
+                if within_cap:
+                    valid, updated, reason = self.check_validity(route_info, local_og)
+                else:
+                    valid, updated, reason = (False, None, f"Component size {n} exceeds.")
+
+                if valid:
+                    self.commit_component(layer_idx, route_info.gate, updated)
+                    paths_current_layer.append(path)
+                    continue
+
+                # Alternative route: re-route using unoccupied nodes 
+                nodes_occupied = [
+                    node
+                    for old_path in paths_current_layer
+                    for node in old_path
+                ]
+                g_temp.remove_nodes_from(nodes_occupied)
+                try:
+                    # find an alternative path 
+                    alt_path = self.valid_path_method()(g_temp, gate[0], gate[1])
+                    alt_info = self.build_route_info(gate, alt_path, self.default_ancilla_idx(alt_path), "control")
+                    paths_current_layer.append(alt_path)
+                    self.commit_route(layer_idx, alt_info)
+                except nx.NetworkXNoPath:
+                    #logger.info(
+                    #    f"No path found for gate {gate}"
+                    #)
+                    remainder_terminal_pairs.append(gate)
+                        
+            else:
+                paths_current_layer.append(path)
+                self.commit_route(layer_idx, route_info)
+
+        # The layer's routing is final here: store each route's allowed steiner T-junction region for later use
+        node_to_gates = self.node_to_gates_by_layer[layer_idx]
+        for gate, route_info in self.routes_by_layer[layer_idx].items():
+            other_nodes = {
+                node
+                for node, gates in node_to_gates.items()
+                if gates - {gate}
+            }
+            route_info.junction_lo, route_info.junction_hi = self.t_junction_bounds(route_info, other_nodes)    
+
+        return remainder_terminal_pairs
+
+    def commit_component(self, layer_idx: int, candidate_gate: Gate, updated: dict[Gate, RouteInfo],
+    ) -> None:
+        """
+        Commit a validated overlap component. The existing routes only change ancilla index and first part (paths remain unchanged),
+        while the new candidate is fully committed via `commit_route`.
+        """
+        # info (ancilla/first part) update for existing routes 
+        for gate, info in updated.items():
+            if gate == candidate_gate:
+                continue
+            self.routes_by_layer[layer_idx][gate] = info
+            if self.overlap_graphs[layer_idx].has_node(gate):
+                self.overlap_graphs[layer_idx].nodes[gate]["route_info"] = info
+
+        self.commit_route(layer_idx, updated[candidate_gate])
+
+    def commit_route(self, layer_idx: int, route_info: RouteInfo) -> None:
+        """
+        commit a valid new route
+        """
+        gate = route_info.gate 
+        node_to_gates = self.node_to_gates_by_layer[layer_idx]
+        self.routes_by_layer[layer_idx][gate] = route_info # store route
+
+        G = self.overlap_graphs[layer_idx]
+        G.add_node(gate, route_info=route_info) # add node 
+        
+        for node in set(route_info.path):
+            # all gates crossing `node` 
+            existing_gates = node_to_gates[node] #set[Gate]
+            for other_gate in existing_gates:
+                if other_gate == gate:
+                    continue      
+                if self.overlap_graphs[layer_idx].has_edge(gate, other_gate): # overlaps
+                    G[gate][other_gate]["overlap_nodes"].add(node)
+                    G[gate][other_gate]["num_overlap"] = len(G[gate][other_gate]["overlap_nodes"])
+                else:
+                    G.add_edge(gate, other_gate, overlap_nodes={node}, num_overlap=1)          
+            existing_gates.add(gate) #update node_to_gates
+        
+        #print("updated overlap graph: ", G)
+    
     def push_remainder_into_layers(
         self,
         layers: list[Sequence[pos | tuple[pos, pos]]],
