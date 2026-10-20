@@ -7,15 +7,15 @@
 
 """Type definitions."""
 
-from typing import TypedDict, Literal
+from typing import TypeAlias, TypedDict, Literal
 from dataclasses import dataclass
-from dataclasses import replace
 
-pos = tuple[int, int]
-Gate = tuple[pos, pos]
+
+pos: TypeAlias = tuple[int, int]          
+Gate: TypeAlias = pos | tuple[pos, pos]
 FirstPart = Literal["control", "target"]
 Layout = dict[str | int, pos | list[pos]]
-VdpDict = dict[str | pos | Gate, list[pos]]
+VdpDict = dict[str | Gate, list[pos]]
 
 
 class HistoryTemp(TypedDict, total=False):  # pragma: no cover
@@ -34,3 +34,29 @@ class RouteInfo:
     # Allowed steiner T-junction index range [junction_lo, junction_hi] on `path`:
     junction_lo: int | None = None
     junction_hi: int | None = None
+
+    @property
+    def ancilla(self) -> pos:
+        return self.path[self.ancilla_idx]
+
+    @property
+    def control(self) -> tuple[pos, ...]:
+        return self.path[: self.ancilla_idx + 1]
+
+    @property
+    def target(self) -> tuple[pos, ...]:
+        return self.path[self.ancilla_idx :]
+
+    @property
+    def subpath1(self) -> tuple[pos, ...]:
+        """The part routed first."""
+        if self.first_part == "control":
+            return self.control
+        return self.target
+
+    @property
+    def subpath2(self) -> tuple[pos, ...]:
+        """The part routed second."""
+        if self.first_part == "control":
+            return self.target
+        return self.control

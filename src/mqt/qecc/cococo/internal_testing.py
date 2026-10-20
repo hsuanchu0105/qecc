@@ -334,3 +334,26 @@ def test_times_t_gates_st(vdp_layers: list[VdpDict], t: int, factories: list[pos
                 factory_times[factory] = t + 1  # s.t. we can directly remove -1 again without case distinction
         factory_times = {f: el - 1 for f, el in factory_times.items()}
     return True
+
+
+def check_phase_disjoint_fg(routes_by_layer):
+    """
+    Two-phase disjointness check for the fine-grained routing.
+
+    `routes_by_layer` maps layer_idx -> {gate: RouteInfo}. 
+    """
+    for i, layer in routes_by_layer.items():
+        first_part_node = set()
+        second_part_node = set()
+        for route_info in layer.values():
+            for node in route_info.subpath1:
+                if node in first_part_node:
+                    msg = f"Node {node} is duplicated in layer {i}"
+                    raise ValueError(msg)
+                first_part_node.add(node)
+            for node in route_info.subpath2:
+                if node in second_part_node:
+                    msg = f"Node {node} is duplicated in layer {i}"
+                    raise ValueError(msg)
+                second_part_node.add(node)
+    return True
