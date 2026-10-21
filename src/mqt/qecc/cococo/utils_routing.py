@@ -1896,6 +1896,8 @@ class TeleportationRouter(BasicRouter):
         reduce_steiner: bool,
         idle_move_type: str,
         reduce_init_steiner: bool = False,
+        vdp_type: str = "coarse",
+        max_overlap: int | None = None,
         stimtest: bool = False,
     ) -> tuple[Any, list[tuple[int, Any]]]:
         """Optimize the positions in batches of size k_lookahead.
@@ -1925,6 +1927,8 @@ class TeleportationRouter(BasicRouter):
             reduce_steiner: Recommended to use True. Decides whether the trees are reduced again (True), such that possibly useless movements are removed. Using False may reduce rutnime however.
             idle_move_type: Recommended to use `later`. asap: moving back is done as frequent as possible. this may destroy however structure of the predicted routing from the steiner search. later: means that moving back is only done when the steiner search is done. if a locking occurs, extra layers with moving back are necessary, but no moving back during the routing of the k_lookahead layers with jump_harvesting = True.
             reduce_init_steiner: Defaults to False and is recommended not to be changed.
+            vdp_type: type of vdp subroutine used, default is coarse-grained. 
+            max_overlap: the threshold of the number of overlaps allowed in a single component in fine-grained method, None for coarse-grained method.
             stimtest: If True, at the end of the computation the schedule is sanity checked. Defaults to False but recommended to use.
 
         Returns:
@@ -1933,6 +1937,16 @@ class TeleportationRouter(BasicRouter):
         if idle_move_type not in {"asap", "later"}:
             msg = "`move_idle_type` must be `asap` or `later`"  # pragma: no cover
             raise ValueError(msg)
+        if vdp_type not in {"coarse", "fine"}:
+            raise ValueError("`vdp_type` must be `coarse` or `fine`")
+        
+        fine_layer_idx = 0
+        self.fine_allowed_junctions = None
+        if vdp_type == "fine":
+            # clear 
+            self.routes_by_layer.clear()
+            self.overlap_graphs.clear()
+            self.node_to_gates_by_layer.clear()
 
         schedule: Any = []
         filename = f"schedule_{dt.datetime.now(dt.UTC).strftime('%Y-%m-%d_%H-%M-%S')}.pkl"  # logging filename
@@ -1966,12 +1980,28 @@ class TeleportationRouter(BasicRouter):
                 "layout": None,
                 "cost_history": None,
                 "idle_move_label": None,
+                "fine_routes": None,
             }
             schedule_temp_for_later = schedule_temp.copy()
             # find vdp solution for the front layer (we adapt layers dynamically, meaning we delete stuff which is already routed)
-            vdp_dict, terminal_pairs_remainder, self.factory_times = self.find_max_vdp_set(
-                layers[0], None, self.factory_times
-            )
+            if vdp_type == "coarse":
+                vdp_dict, terminal_pairs_remainder, self.factory_times = self.find_max_vdp_set(
+                    layers[0], None, self.factory_times
+                )
+                fine_routes = None
+            elif vdp_type == "fine":
+                terminal_pairs_remainder = self.find_fine_grained_vdp(
+                    fine_layer_idx,
+                    layers[0],
+                    None,
+                    self.factory_times,
+                    max_overlap,
+                )
+                fine_routes = dict(self.routes_by_layer[fine_layer_idx])
+                vdp_dict = {gate: list(ri.path) for gate, ri in fine_routes.items()}
+                fine_layer_idx += 1
+
+            schedule_temp["fine_routes"] = fine_routes
             logger.info(
                 "Iteration %d: |vdp_dict|=%d, pushing |terminal_pairs_remainder|=%d, remaining |layers|=%d",
                 it,
@@ -2009,6 +2039,7 @@ class TeleportationRouter(BasicRouter):
                 if self.factory_times[key] != 0:
                     self.factory_times[key] -= 1
 
+            layout_before_moves = layout.copy()
             if idle_move_type == "later":
                 # this does idle moves BEFORE we do the steiner search, i.e. later the metric and real routing will coincide.
                 # if vdp_dict is empty, this also adds layers of pure idle moves to avoid getting stuck.
@@ -2106,7 +2137,7 @@ class TeleportationRouter(BasicRouter):
             if best_steiner_init is None:  # break earlier, similar to above
                 schedule_temp["vdp_dict"] = vdp_dict
                 schedule_temp["logical_pos"] = self.logical_pos.copy()
-                schedule_temp["layout"] = layout.copy()
+                schedule_temp["layout"] = layout_before_moves.copy()
                 schedule.append(schedule_temp)
                 with pathlib.Path(filename).open("wb") as f:
                     pickle.dump(schedule, f)
@@ -2277,9 +2308,24 @@ class TeleportationRouter(BasicRouter):
                     # initialize another schedule temp
                     schedule_temp = schedule_temp_for_later.copy()
                     # route
-                    vdp_dict, terminal_pairs_remainder, self.factory_times = self.find_max_vdp_set(
-                        layers_k[0], self.logical_pos, self.factory_times
-                    )
+                    if vdp_type == "coarse":
+                        vdp_dict, terminal_pairs_remainder, self.factory_times = self.find_max_vdp_set(
+                            layers_k[0], self.logical_pos, self.factory_times
+                        )
+                        fine_routes = None
+                    elif vdp_type == "fine":
+                        terminal_pairs_remainder = self.find_fine_grained_vdp(
+                            fine_layer_idx,
+                            layers_k[0],
+                            None,
+                            self.factory_times,
+                            max_overlap,
+                        )
+                        fine_routes = dict(self.routes_by_layer[fine_layer_idx])
+                        vdp_dict = {gate: list(ri.path) for gate, ri in fine_routes.items()}
+                        fine_layer_idx += 1
+
+                    schedule_temp["fine_routes"] = fine_routes
                     if len(layers_k) == 1 and len(terminal_pairs_remainder) == 0:
                         # no further steps needed
                         schedule_temp["vdp_dict"] = vdp_dict
@@ -2403,11 +2449,19 @@ class TeleportationRouter(BasicRouter):
                 warnings.warn("Stim test failed: Pushing gates causes trouble):", stacklevel=2)
 
         # test whether something overlapping
-        if tst.check_duplicate_nodes_per_layer(schedule):
-            logger.info("No duplicates found in any layer of the schedule - hence all good(:")
         if tst.check_path_on_logical(schedule):
             logger.info("No path/tree is placed on a logical pos. All good(:")
-        if tst.test_times_t_gates_opt(schedule, self.t, self.factory_pos):
-            logger.info("All good with the reset times (:")
+
+        # fine-grained test 
+        if vdp_type == "fine":
+            # check that two-phase routing is valid 
+            if tst.check_phase_disjoint_fg(self.routes_by_layer):
+                logger.info("No shared-phase nodes in any fine-grained layer - all good(:")
+        # coarse-grained test 
+        elif vdp_type == "coarse":
+            if tst.check_duplicate_nodes_per_layer(schedule):
+                logger.info("No duplicates found in any layer of the schedule - hence all good(:")
+            if tst.test_times_t_gates_opt(schedule, self.t, self.factory_pos):
+                logger.info("All good with the reset times (:")
 
         return schedule, improvement_history
