@@ -954,7 +954,7 @@ class BasicRouter:
                 logger.info("paths do not occupy logical pos (:")
 
             if tst.check_phase_disjoint_fg(self.routes_by_layer):
-                logger.info("no duplicate nodes in fine grained routing (:")
+                logger.info("no duplicates found in fine-grained routing (:")
             else:
                 logger.info("Problematic! Nodes are used by two paths")   
 
@@ -1122,6 +1122,7 @@ class TeleportationRouter(BasicRouter):
         steiner_init_type: str,
         layers: list[Sequence[Gate]] | None = None,
         k_lookahead: int | None = None,
+        fine_routes = None,
     ) -> SteinerType:
         """Initialize a random steiner tree per path which are non-overlapping.
 
@@ -1131,6 +1132,10 @@ class TeleportationRouter(BasicRouter):
         However, this turned out not to be really useful, because movements can be relevant even if this constraint does not hold.
         Therefore, layers and k_lookahead default to None.
         """
+        # allowed T-junction nodes per gate; stays None in coarse mode
+        self.fine_allowed_junctions = {} if fine_routes is not None else None
+
+        vdp_dict_reduced = vdp_dict.copy()
         # find out which qubits are actually moved in layers[:k_lookahead]
         if layers is not None and k_lookahead is not None:
             layers_temp = layers[:k_lookahead]
@@ -1138,13 +1143,11 @@ class TeleportationRouter(BasicRouter):
             for layer in layers_temp:
                 terminals += layer
             qubits_k_lookahead = [t for outer in terminals for t in outer]
-            # remove those from vdp_cit which are not used, such that no tree is created for them
+            # remove those from vdp_dict which are not used, such that no tree is created for them
             vdp_dict_reduced = {}
             for key, val in vdp_dict.items():
                 if key[0] in qubits_k_lookahead or key[1] in qubits_k_lookahead:
                     vdp_dict_reduced.update({key: val})
-
-            vdp_dict = vdp_dict_reduced
 
         # remove the nodes from the graph which are already occupied by the magic/logical patches
         # we allow the 3-terminal to be placed on the path, thus the graph must be adapted per terminal choice
@@ -1159,7 +1162,7 @@ class TeleportationRouter(BasicRouter):
 
         steiner_dct: SteinerType = {}
         # for each already present path, choose one random ancilla terminal which is allowed to be on the same path, but not on another path
-        for key, path in vdp_dict.items():
+        for key, path in vdp_dict_reduced.items():
             if isinstance(key, str) and key.startswith("idle"):
                 continue  # we do not want to create a tree at an idling path!
             other_paths = [
@@ -1174,6 +1177,21 @@ class TeleportationRouter(BasicRouter):
                 1:-1
             ]  # remove last and first node from the list because those are logical data patches
             random.shuffle(path)
+
+            # candidates for T-junction
+            if fine_routes is not None and key in fine_routes:
+                ri = fine_routes[key]
+                lo = getattr(ri, "junction_lo", None)
+                hi = getattr(ri, "junction_hi", None)
+                if lo is None or hi is None:
+                    raise NotImplementedError("junction lower/upper bound is empty")
+                junction_candidates = pathcopy[lo : hi + 1]
+            else:
+                junction_candidates = pathcopy[1:-1]  # remove last and first node from the list because those are logical data patches
+            random.shuffle(junction_candidates)
+            if self.fine_allowed_junctions is not None:
+                self.fine_allowed_junctions[key] = set(junction_candidates)
+
             if steiner_init_type == "full_random":
                 for node_on_path in path:  # loop in case a random node has  no other reachable nodes
                     # determine all reachable nodes from that chosen node
@@ -1397,6 +1415,53 @@ class TeleportationRouter(BasicRouter):
                 result.append(new if item == old else item)
         return result
 
+    def calculate_cost(self, metric, vdp_type, max_overlap, layers, logical_pos, factory_times, layout):
+        cost = 0
+        schedule = None  # only the "exact" metric produces one
+        if metric == "crossing":
+                cost = self.count_crossings(
+                    layers, logical_pos
+                )  # overwrite this in the upcoming loop
+        elif metric == "exact":
+            if vdp_type == "coarse":
+                schedule, _ = self.find_total_vdp_layers_dyn(
+                    layers,
+                    logical_pos,
+                    factory_times,
+                    layout,
+                )  # initially the self.logical pos can be used. later you need a logical_pos outside of self
+            elif vdp_type == "fine":
+                # In find_total_fine_grained_vdp_dyn, we clear these variables and rebuilt them, hence first saved 
+                _saved = (
+                    self.routes_by_layer,
+                    self.overlap_graphs,
+                    self.node_to_gates_by_layer,
+                )
+                self.routes_by_layer = defaultdict(dict)
+                self.overlap_graphs = defaultdict(nx.Graph)
+                self.node_to_gates_by_layer = defaultdict(lambda: defaultdict(set))
+                try:
+                    schedule, _ = self.find_total_fine_grained_vdp_dyn(
+                        layers,
+                        logical_pos,
+                        factory_times,
+                        max_overlap,
+                        layout,
+                        testing = False,
+                    )
+                finally:
+                    (self.routes_by_layer, self.overlap_graphs, self.node_to_gates_by_layer) = _saved
+            else:
+                raise NotImplementedError("Other vdp types are not implemented yet.")
+
+            if schedule is not None:
+                cost = len(schedule)
+            else:
+                cost = lock_penalty
+        else:
+            raise NotImplementedError("Other metrics than crossing and exact not implemented yet.")
+        return cost, schedule
+    
     def run_annealing(
         self,
         next_layers: list[Sequence[Gate]],
@@ -1409,6 +1474,9 @@ class TeleportationRouter(BasicRouter):
         radius: int,
         vdp_dict: VdpDict,
         layout: dict[int, pos],
+        vdp_type: str = "coarse", 
+        fine_routes = None, 
+        max_overlap: int | None = None,
     ) -> tuple[
         SteinerType | None,  # best_steiner
         int,  # best_cost
@@ -1451,24 +1519,9 @@ class TeleportationRouter(BasicRouter):
             raise ValueError(msg)
 
         self.logical_pos_temp: list[pos] = self.logical_pos.copy()
-
+        cost, schedule = self.calculate_cost(self.metric, vdp_type, max_overlap, next_layers[:k_lookahead], self.logical_pos_temp, factory_times_copy, layout)
+        
         steiner_dct = init_steiner_dct.copy()
-        if self.metric == "crossing":
-            cost = self.count_crossings(
-                cast("list[list[tuple[pos,pos]]]", next_layers[:k_lookahead]),
-                self.logical_pos_temp,
-            )  # overwrite this in the upcoming loop
-        elif self.metric == "exact":
-            schedule, _ = self.find_total_vdp_layers_dyn(
-                next_layers[:k_lookahead],
-                self.logical_pos_temp,
-                factory_times_copy,
-                layout,
-            )  # initially the self.logical pos can be used. later you need a logical_pos outside of self
-            cost = len(schedule) if schedule is not None else lock_penalty
-        else:
-            msg = "Other metrics than crossing and exact not implemented yet."  # pragma: no cover
-            raise NotImplementedError(msg)
         best_steiner: SteinerType | None = steiner_dct
         best_cost = cost
         best_move_type_lst = {}
@@ -1503,8 +1556,16 @@ class TeleportationRouter(BasicRouter):
                 if len(key_candidate) == 3:
                     (a, b, terminal) = key_candidate
                     # randomly choose whether we shift control to ancilla or target to ancilla
-                    move_type = random.choice(["target", "control"])  # ruff:ignore[suspicious-non-cryptographic-random-usage]
+                    # randomly choose whether we shift control to ancilla or target to ancilla
+                    if vdp_type == "coarse":
+                        move_type = random.choice(["target", "control"]) # ruff:ignore[suspicious-non-cryptographic-random-usage]
+                    # in fine-grained method, we don't have choice for the move type 
+                    elif vdp_type == "fine":
+                        ri = fine_routes[(a, b)]
+                        fp = getattr(ri, "first_part", None)
+                        move_type = "target" if fp == "control" else "control"
                     move_type_lst_temp.update({(a, b, terminal): move_type})
+
                     if move_type == "target":
                         for j, next_layer in enumerate(next_layers_copy):  # update all future layers
                             next_layers_copy[j] = self.replace_pos(next_layer, b, terminal)
@@ -1535,18 +1596,7 @@ class TeleportationRouter(BasicRouter):
                     raise RuntimeError(msg)
             # 2. compute the crossing metric for next_layer
             layers_for_metric = next_layers_copy[:k_lookahead]
-            if self.metric == "crossing":
-                candidate_cost = self.count_crossings(
-                    cast("Sequence[Sequence[tuple[pos, pos]]]", layers_for_metric), logical_pos_temp
-                )
-            elif self.metric == "exact":
-                schedule, _ = self.find_total_vdp_layers_dyn(
-                    layers_for_metric, logical_pos_temp, factory_times_copy, layout_mod
-                )
-                candidate_cost = len(schedule) if schedule is not None else lock_penalty
-            else:
-                msg = "Other metrics than crossing and exact not implemented yet."  # pragma: no cover
-                raise NotImplementedError(msg)
+            candidate_cost, schedule = self.calculate_cost(self.metric,  vdp_type, max_overlap, layers_for_metric, logical_pos_temp, factory_times_copy, layout_mod)
 
             # except ValueError:
             #    continue #skip if some config locks the qubits such that you cannot even evaluate count crossings
@@ -1591,6 +1641,8 @@ class TeleportationRouter(BasicRouter):
         best_cost: int,
         k_lookahead: int,
         layout: dict[int, pos],
+        vdp_type: str = "coarse",
+        max_overlap: int | None = None,
     ) -> tuple[
         SteinerType,
         dict[tuple[pos, ...], str],
@@ -1645,23 +1697,16 @@ class TeleportationRouter(BasicRouter):
                         msg = f"other move type than expected: {move_type}"  # pragma: no cover
                         raise RuntimeError(msg)
                 # 2. compute the crossing metric for next_layer
-                try:  # ruff:ignore[too-many-statements-in-try-clause]
-                    if self.metric == "crossing":
-                        candidate_cost = self.count_crossings(
-                            cast("Sequence[Sequence[tuple[pos, pos]]]", next_layers_copy[:k_lookahead]),
-                            logical_pos_temp,
-                        )
-                    elif self.metric == "exact":
-                        schedule, _ = self.find_total_vdp_layers_dyn(
-                            next_layers_copy[:k_lookahead],
-                            logical_pos_temp,
-                            factory_times_copy,
-                            layout_mod,
-                        )
-                        candidate_cost = len(schedule) if schedule is not None else lock_penalty
-                    else:
-                        msg = "Other metrics than crossing and exact not implemented yet."  # pragma: no cover
-                        raise NotImplementedError(msg)
+                try:
+                    candidate_cost, schedule = self.calculate_cost(
+                        self.metric,
+                        vdp_type,
+                        max_overlap,
+                        next_layers_copy[:k_lookahead],
+                        logical_pos_temp,
+                        factory_times_copy,
+                        layout_mod,
+                    )
                 except ValueError:
                     continue
 
