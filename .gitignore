@@ -76,3 +76,6 @@ CLAUDE.md
 .Trashes
 Thumbs.db
 ehthumbs.db
+
+# Output
+*.pkl
