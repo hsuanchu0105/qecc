@@ -1193,9 +1193,15 @@ class TeleportationRouter(BasicRouter):
                 self.fine_allowed_junctions[key] = set(junction_candidates)
 
             if steiner_init_type == "full_random":
-                for node_on_path in path:  # loop in case a random node has  no other reachable nodes
+                for node_on_path in junction_candidates:  # loop in case a random node has  no other reachable nodes
                     # determine all reachable nodes from that chosen node
-                    reachable_nodes = list(nx.single_source_shortest_path_length(g_temp_temp, node_on_path).keys())
+                    current_path_nodes = [node for node in path if node != node_on_path]
+                    g_temp_temp.remove_nodes_from(current_path_nodes)
+                    reachable_nodes = list(
+                        nx.single_source_shortest_path_length(
+                            g_temp_temp, node_on_path
+                        ).keys()
+                    )
                     if reachable_nodes:
                         flag = True
                         break  # if there is a reachable node found, take it, otherwise try another random node
@@ -1216,7 +1222,7 @@ class TeleportationRouter(BasicRouter):
                     path_steiner = min(paths_lst_temp, key=len)
             elif steiner_init_type == "on_path_random":
                 # just choose a random terminal ON the path
-                terminal_node = random.choice(path)  # ruff:ignore[suspicious-non-cryptographic-random-usage]
+                terminal_node = random.choice(junction_candidates)  # ruff:ignore[suspicious-non-cryptographic-random-usage]
                 # terminal on the path does not need an extended path, but list should not be empty, otherwise error.
                 path_steiner = [terminal_node]
             else:
@@ -1241,6 +1247,20 @@ class TeleportationRouter(BasicRouter):
 
         For each tree in steiner_dct a new location of the 3rd terminal is updated randomly.
         """
+
+        def allowed_starts(key_tree, path1):
+            """
+            Candidate T-junction nodes.  In fine-grained mode
+            the junction may only sit in the committed ancilla's region.
+            """
+            allowed = None
+            if len(key_tree) == 3 and self.fine_allowed_junctions:
+                allowed = self.fine_allowed_junctions.get((key_tree[0], key_tree[1]))
+            if allowed is None:
+                return path1[1:-1]
+            return [n for n in path1[1:-1] if n in allowed]
+
+        
         if self.logical_pos_temp is None:
             msg = "Need to initialize logical pos temp properly in a summarizing method."  # pragma: no cover
             raise RuntimeError(msg)
@@ -1306,6 +1326,7 @@ class TeleportationRouter(BasicRouter):
             if len(neighborhood) == 1:  # if only one neighbor, i.e. the terminal itself
                 # new_terminal = None #to skip the updating of the root node below.
                 break
+            starts = None if key_tree[0] == "idle" else allowed_starts(key_tree, path1)
             path_terminal: list[pos] = []
             while True:
                 new_terminal = random.choice(list(neighborhood))  # ruff:ignore[suspicious-non-cryptographic-random-usage]
@@ -1322,7 +1343,7 @@ class TeleportationRouter(BasicRouter):
             # !TODO should i skip this since we do it globally afterwards again?
             # (A) loop to possibly find shorter path_terminal
             paths_lst_temp: list[list[pos]] = []  # collect all paths from path1[1:-1] to new_terminal
-            for node_on_path in path1[1:-1]:
+            for node_on_path in starts:
                 try:
                     path_temp = nx.dijkstra_path(g_temp_temp, node_on_path, new_terminal)
                     paths_lst_temp.append(path_temp)
@@ -1378,7 +1399,8 @@ class TeleportationRouter(BasicRouter):
                         if node in g_temp_temp.nodes() and node not in path1 + path2:  # {terminal, path2[0]}:
                             g_temp_temp.remove_node(node)
                 paths_lst_temp = []  # collect all paths from path1[1:-1] to new_terminal
-                for node_on_path in path1[1:-1]:
+                starts = None if key_tree[0] == "idle" else allowed_starts(key_tree, path1)
+                for node_on_path in starts:
                     try:
                         path_temp = nx.dijkstra_path(g_temp_temp, node_on_path, terminal)
                         paths_lst_temp.append(path_temp)
@@ -2077,6 +2099,7 @@ class TeleportationRouter(BasicRouter):
                     steiner_init_type,
                     layers=layers,
                     k_lookahead=k_lookahead,
+                    fine_routes = fine_routes
                 )
                 if len(steiner_dct) == 0:
                     best_steiner_init = None
@@ -2100,6 +2123,9 @@ class TeleportationRouter(BasicRouter):
                         radius=radius,
                         vdp_dict=cast("VdpDict", schedule_temp["vdp_dict"]),
                         layout=layout,
+                        vdp_type = "fine", 
+                        fine_routes = fine_routes, 
+                        max_overlap = max_overlap,
                     )
                     # store improvement history
                     improvement_history.append((best_cost, cost_history[0]))
@@ -2109,6 +2135,7 @@ class TeleportationRouter(BasicRouter):
                     steiner_init_type,
                     layers=None,
                     k_lookahead=None,
+                    fine_routes = fine_routes 
                 )
                 (
                     best_steiner_init,
@@ -2129,6 +2156,9 @@ class TeleportationRouter(BasicRouter):
                     radius=radius,
                     vdp_dict=cast("VdpDict", schedule_temp["vdp_dict"]),
                     layout=layout,
+                    vdp_type = "fine", 
+                    fine_routes = fine_routes, 
+                    max_overlap = max_overlap,
                 )
                 # store improvement history
                 improvement_history.append((best_cost, cost_history[0]))
@@ -2152,6 +2182,8 @@ class TeleportationRouter(BasicRouter):
                         best_cost,
                         k_lookahead,
                         layout,
+                        vdp_type,
+                        max_overlap,
                     )
                     if best_steiner_init is not None:
                         if len(best_steiner) < len(best_steiner_init):
