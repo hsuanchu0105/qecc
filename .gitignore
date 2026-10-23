@@ -79,3 +79,4 @@ ehthumbs.db
 
 # Output
 *.pkl
+*.json
