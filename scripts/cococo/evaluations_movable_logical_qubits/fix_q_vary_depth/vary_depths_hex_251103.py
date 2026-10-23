@@ -49,8 +49,10 @@ assert q == len(data_qubit_locs), "given q does not coincide with your chosen la
 sigma = 1
 n_circ = 10
 
-gates_list = [320, 640, 1280, 2560]
-depths_list = [40, 80, 160, 320]
+#gates_list = [320, 640, 1280, 2560]
+#depths_list = [40, 80, 160, 320]
+gates_list = [320]
+depths_list = [40]
 for num_gates, depth in zip(gates_list, depths_list, strict=False):
     assert num_gates == depth * j, "depths list and gates_list does not coincide"
 gates_str = "_".join(map(str, gates_list))
