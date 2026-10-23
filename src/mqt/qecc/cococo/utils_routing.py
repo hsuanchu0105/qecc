@@ -2123,7 +2123,7 @@ class TeleportationRouter(BasicRouter):
                         radius=radius,
                         vdp_dict=cast("VdpDict", schedule_temp["vdp_dict"]),
                         layout=layout,
-                        vdp_type = "fine", 
+                        vdp_type = vdp_type, 
                         fine_routes = fine_routes, 
                         max_overlap = max_overlap,
                     )
@@ -2156,7 +2156,7 @@ class TeleportationRouter(BasicRouter):
                     radius=radius,
                     vdp_dict=cast("VdpDict", schedule_temp["vdp_dict"]),
                     layout=layout,
-                    vdp_type = "fine", 
+                    vdp_type = vdp_type, 
                     fine_routes = fine_routes, 
                     max_overlap = max_overlap,
                 )
