@@ -5,7 +5,7 @@
 #
 # Licensed under the MIT License
 
-"""fg-bench"""
+"""fg-bench."""
 
 import datetime as dt
 import json
@@ -51,8 +51,8 @@ n_circ = 10
 
 gates_list = [320, 640, 1280, 2560]
 depths_list = [40, 80, 160, 320]
-#gates_list = [320]
-#depths_list = [40]
+# gates_list = [320]
+# depths_list = [40]
 for num_gates, depth in zip(gates_list, depths_list, strict=False):
     assert num_gates == depth * j, "depths list and gates_list does not coincide"
 gates_str = "_".join(map(str, gates_list))
@@ -84,7 +84,7 @@ reduce_steiner = True
 idle_move_type = "later"
 reduce_init_steiner = False
 
-max_overlap = 8 
+max_overlap = 8
 
 terminal_pairs_list = []
 for pairs in pairs_lst[:n_circ]:
@@ -150,22 +150,22 @@ for num_gates in gates_list:
                 seed=n_j,
             )
             schedule, history = quilt.optimize_layers(
-                    temp_circuit,
-                    layout,
-                    max_iters,
-                    T_start,
-                    T_end,
-                    alpha,
-                    radius = radius,
-                    k_lookahead = k_lookahead,
-                    steiner_init_type = steiner_init_type,
-                    jump_harvesting = jump_harvesting,
-                    reduce_steiner = reduce_steiner,
-                    idle_move_type = idle_move_type,
-                    reduce_init_steiner = reduce_init_steiner,
-                    vdp_type = "fine",
-                    max_overlap = max_overlap,
-                    stimtest = True,
+                temp_circuit,
+                layout,
+                max_iters,
+                T_start,
+                T_end,
+                alpha,
+                radius=radius,
+                k_lookahead=k_lookahead,
+                steiner_init_type=steiner_init_type,
+                jump_harvesting=jump_harvesting,
+                reduce_steiner=reduce_steiner,
+                idle_move_type=idle_move_type,
+                reduce_init_steiner=reduce_init_steiner,
+                vdp_type="fine",
+                max_overlap=max_overlap,
+                stimtest=True,
             )
             schedule_list_opt_temp.append(schedule)
             history_temp.append(history)

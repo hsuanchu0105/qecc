@@ -17,7 +17,7 @@ import stim
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from .types import VdpDict, pos
+    from .types import Gate, RouteInfo, VdpDict, pos
 
 
 def extract_gates_schedule(schedule: Any) -> Sequence[pos | tuple[pos, pos]]:  # ruff:ignore[any-type]
@@ -336,11 +336,10 @@ def test_times_t_gates_st(vdp_layers: list[VdpDict], t: int, factories: list[pos
     return True
 
 
-def check_phase_disjoint_fg(routes_by_layer):
-    """
-    Two-phase disjointness check for the fine-grained routing.
+def check_phase_disjoint_fg(routes_by_layer: dict[int, dict[Gate, RouteInfo]]) -> bool:
+    """Two-phase disjointness check for the fine-grained routing.
 
-    `routes_by_layer` maps layer_idx -> {gate: RouteInfo}. 
+    `routes_by_layer` maps layer_idx -> {gate: RouteInfo}.
     """
     for i, layer in routes_by_layer.items():
         first_part_node = set()

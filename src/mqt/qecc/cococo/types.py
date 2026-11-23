@@ -7,11 +7,10 @@
 
 """Type definitions."""
 
-from typing import TypeAlias, TypedDict, Literal
 from dataclasses import dataclass
+from typing import Literal, TypeAlias, TypedDict
 
-
-pos: TypeAlias = tuple[int, int]          
+pos = tuple[int, int]
 Gate: TypeAlias = pos | tuple[pos, pos]
 FirstPart = Literal["control", "target"]
 Layout = dict[str | int, pos | list[pos]]
@@ -25,8 +24,11 @@ class HistoryTemp(TypedDict, total=False):  # pragma: no cover
     layout_init: dict[str | int, pos | list[pos]]
     layout_final: dict[str | int, pos | list[pos]]
 
+
 @dataclass
 class RouteInfo:
+    """Fine-grained route of one gate."""
+
     gate: Gate
     path: tuple[pos, ...]
     ancilla_idx: int
@@ -37,14 +39,17 @@ class RouteInfo:
 
     @property
     def ancilla(self) -> pos:
+        """The ancilla node on the path."""
         return self.path[self.ancilla_idx]
 
     @property
     def control(self) -> tuple[pos, ...]:
+        """The path from the control qubit to the ancilla, both included."""
         return self.path[: self.ancilla_idx + 1]
 
     @property
     def target(self) -> tuple[pos, ...]:
+        """The path from the ancilla to the target qubit, both included."""
         return self.path[self.ancilla_idx :]
 
     @property

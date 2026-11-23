@@ -5,7 +5,7 @@
 #
 # Licensed under the MIT License
 
-"""fg-bench"""
+"""fg-bench."""
 
 import datetime as dt
 import json
@@ -51,8 +51,8 @@ n_circ = 10
 
 gates_list = [320, 640, 1280, 2560]
 depths_list = [40, 80, 160, 320]
-#gates_list = [320]
-#depths_list = [40]
+# gates_list = [320]
+# depths_list = [40]
 for num_gates, depth in zip(gates_list, depths_list, strict=False):
     assert num_gates == depth * j, "depths list and gates_list does not coincide"
 gates_str = "_".join(map(str, gates_list))
@@ -84,7 +84,7 @@ reduce_steiner = True
 idle_move_type = "later"
 reduce_init_steiner = False
 
-max_overlap = 8 
+max_overlap = 8
 
 terminal_pairs_list = []
 for pairs in pairs_lst[:n_circ]:
@@ -153,13 +153,11 @@ for num_gates in gates_list:
                 quilt.split_layer_terminal_pairs(temp_circuit),
                 None,
                 None,
-                max_overlap = max_overlap,
+                max_overlap=max_overlap,
                 layout=layout,
                 testing=True,
             )
-            fine_routes = {
-                idx: dict(routes) for idx, routes in quilt.routes_by_layer.items()
-            }
+            fine_routes = {idx: dict(routes) for idx, routes in quilt.routes_by_layer.items()}
             print("fine grained depth: ", len(fine_routes))
             results_temp_opt.append(fine_routes)
 
@@ -171,15 +169,15 @@ for num_gates in gates_list:
     layers_tot.append(layers_temp)
 
     save = [results_list_st, results_list_opt, layers_tot]
-    with open(path, "wb") as f:
+    with pathlib.Path(path).open("wb") as f:
         pickle.dump(save, f)
 end = time.time()
 print("total runtime: ", end - start)
 
 
 # reload
-with open(path, "rb") as f:
-    saved = pickle.load(f)
+with pathlib.Path(path).open("rb") as f:
+    saved = pickle.load(f)  # ruff:ignore[suspicious-pickle-usage]
 [results_list_st, results_list_opt, layers_tot] = saved
 
 

@@ -13,14 +13,15 @@ import collections
 import datetime as dt
 import itertools
 import logging
+import operator
 import pathlib
 import pickle  # ruff:ignore[suspicious-pickle-import]
 import random
 import sys
 import warnings
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, cast
 from dataclasses import replace
+from typing import TYPE_CHECKING, Any, cast
 
 import networkx as nx
 import numpy as np
@@ -28,10 +29,11 @@ import numpy as np
 import mqt.qecc.cococo.internal_testing as tst
 from mqt.qecc.cococo import dag_helper
 
-from .types import pos, Gate, FirstPart, RouteInfo
+from .types import FirstPart, Gate, RouteInfo, pos
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
     from .types import VdpDict
 
 logger = logging.getLogger(__name__)
@@ -96,18 +98,26 @@ class BasicRouter:
         self.routes_by_layer: dict[int, dict[Gate, RouteInfo]] = defaultdict(dict)
         self.overlap_graphs: dict[int, nx.Graph] = defaultdict(nx.Graph)
         self.node_to_gates_by_layer: dict[int, dict[pos, set[Gate]]] = defaultdict(lambda: defaultdict(set))
-        self.fine_allowed_junctions: dict[Gate, set[pos]] | None = None
+        self.fine_allowed_junctions: dict[str | Gate, set[pos]] | None = None
 
-    def default_ancilla_idx(self, path: list[pos]) -> int:
+    @staticmethod
+    def default_ancilla_idx(path: list[pos]) -> int:
+        """Return the default ancilla index as the middle node of `path`."""
         if len(path) < 3:
-            raise ValueError(f"Path too short for internal ancilla: {path}")
+            msg = f"Path too short for internal ancilla: {path}"
+            raise ValueError(msg)
         return len(path) // 2
 
-    
-    def build_route_info(self, gate: Gate, path: list[pos], ancilla_idx: int , first_part: FirstPart = "control",
+    @staticmethod
+    def build_route_info(
+        gate: Gate,
+        path: list[pos],
+        ancilla_idx: int,
+        first_part: FirstPart = "control",
     ) -> RouteInfo:
+        """Create the `RouteInfo` of `gate` routed along `path`."""
         return RouteInfo(gate=gate, path=tuple(path), ancilla_idx=ancilla_idx, first_part=first_part)
-    
+
     @staticmethod
     def path_sc(g: nx.Graph, control: pos, target: pos) -> list[pos]:
         """Find the shortest path with Dijkstra but with constraints for standard sc.
@@ -366,11 +376,10 @@ class BasicRouter:
 
     @staticmethod
     def ancilla_region_bounds(path_len: int, blocks: list[dict], region: int) -> tuple[int, int]:
-        """
-        [lo, hi] range of ancilla indices for `region` of a path.
+        """[lo, hi] range of ancilla indices for `region` of a path.
 
         `region` == j means the ancilla sits between block j-1 and block j, so blocks
-        0..j-1 fall on the control side and blocks j..end on the target side. 
+        0..j-1 fall on the control side and blocks j..end on the target side.
         """
         m = len(blocks)
         lo = 1 if region == 0 else blocks[region - 1]["end"] + 1
@@ -379,122 +388,106 @@ class BasicRouter:
 
     @staticmethod
     def overlap_blocks(path: list[pos], other_paths: set[pos]) -> list[dict]:
-        """
-        Overlap blocks of `path` against `other_paths`.
-        """
+        """Overlap blocks of `path` against `other_paths`."""
         blocks = []
         start = None
         for i in range(1, len(path) - 1):
             if path[i] in other_paths:
                 if start is None:
-                    start = i          
-            elif start is not None: # end of this block 
+                    start = i
+            elif start is not None:  # end of this block
                 blocks.append({"start": start, "end": i - 1})
-                start = None # reset the start for the next block 
-        if start is not None:   # last block
+                start = None  # reset the start for the next block
+        if start is not None:  # last block
             blocks.append({"start": start, "end": len(path) - 2})
         return blocks
 
     @staticmethod
     def is_consecutive(sorted_idxs: list[int]) -> bool:
         """True if the sorted indices form one contiguous block."""
-        return all(
-            sorted_idxs[k + 1] - sorted_idxs[k] == 1
-            for k in range(len(sorted_idxs) - 1)
-        )
+        return all(sorted_idxs[k + 1] - sorted_idxs[k] == 1 for k in range(len(sorted_idxs) - 1))
 
     @staticmethod
     def block_phase(side: str, first_part: FirstPart) -> int:
-        """
-        Phase (1 = routed first, 2 = routed second) in which a path occupies a block
-        that lies on the given side of its ancilla, given which end is routed first.
-        """
+        """Phase (1 = routed first, 2 = routed second) in which a path occupies a block that lies on the given side of its ancilla, given which end is routed first."""
         if side == "control":
             return 1 if first_part == "control" else 2
         return 2 if first_part == "control" else 1
 
     def t_junction_bounds(self, route_info: RouteInfo, overlap_paths: set[pos]) -> tuple[int, int]:
-        """
-        [lo, hi] path-index range where a steiner T-junction may attach for a fine-grained route
-        for coarse-grained method, it degenerates to the whole interior [1, len-2].
-        """
+        """[lo, hi] path-index range where a steiner T-junction may attach for a fine-grained route for coarse-grained method, it degenerates to the whole interior [1, len-2]."""
         path = list(route_info.path)
         blocks = self.overlap_blocks(path, overlap_paths)
         a_idx = route_info.ancilla_idx
         assert all(a_idx < b["start"] or a_idx > b["end"] for b in blocks), (
-            f"Committed ancilla_idx {a_idx} lies inside an overlap block "
-            f"for gate {route_info.gate}."
+            f"Committed ancilla_idx {a_idx} lies inside an overlap block for gate {route_info.gate}."
         )
         region = sum(1 for b in blocks if b["end"] < a_idx)
         lo, hi = self.ancilla_region_bounds(len(path), blocks, region)
         assert lo <= a_idx <= hi, "internal error: ancilla outside its region bounds"
         return lo, hi
-    
 
     def direct_overlaps(self, layer_idx: int, route_info: RouteInfo) -> dict[Gate, set[pos]]:
-            """
-            Check which existing routes in this layer overlap with the candidate route.
-    
-            return dict{gate: set of overlapped nodes}
-            """
-            node_to_gates = self.node_to_gates_by_layer[layer_idx] # dict[pos, set[Gate]]
-            candidate_nodes = set(route_info.path)
-    
-            overlaps: dict[Gate, set[pos]] = defaultdict(set)
-            for node in candidate_nodes:
-                for other_gate in node_to_gates.get(node, set()):
-                    if other_gate == route_info.gate:
-                        continue
-                    overlaps[other_gate].add(node)
-    
-            return dict(overlaps)
-    
-    def local_overlap_graph(self, layer_idx: int, route_info: RouteInfo) -> nx.Graph:
-        """
-        Build the local overlap graph containing the candidate route.
-        """
-        #print("local overlap function check: ")
-        #print("Gate: ", route_info.gate)
+        """Check which existing routes in this layer overlap with the candidate route.
 
-        G = self.overlap_graphs[layer_idx]
-        direct_overlaps = self.direct_overlaps(layer_idx, route_info) # dict[gate, overlap_nodes]
+        return dict{gate: set of overlapped nodes}
+        """
+        node_to_gates = self.node_to_gates_by_layer[layer_idx]  # dict[pos, set[Gate]]
+        candidate_nodes = set(route_info.path)
+
+        overlaps: dict[Gate, set[pos]] = defaultdict(set)
+        for node in candidate_nodes:
+            for other_gate in node_to_gates.get(node, set()):
+                if other_gate == route_info.gate:
+                    continue
+                overlaps[other_gate].add(node)
+
+        return dict(overlaps)
+
+    def local_overlap_graph(self, layer_idx: int, route_info: RouteInfo) -> nx.Graph:
+        """Build the local overlap graph containing the candidate route."""
+        # print("local overlap function check: ")
+        # print("Gate: ", route_info.gate)
+
+        og = self.overlap_graphs[layer_idx]
+        direct_overlaps = self.direct_overlaps(layer_idx, route_info)  # dict[gate, overlap_nodes]
         candidate_gate = route_info.gate
-        
-        if not direct_overlaps: # valid 
-            H = nx.Graph()
-            H.add_node(candidate_gate, route_info=route_info, is_candidate=True)
-            return H
+
+        if not direct_overlaps:  # valid
+            h = nx.Graph()
+            h.add_node(candidate_gate, route_info=route_info, is_candidate=True)
+            return h
 
         # Collect existing connected components touched by this candidate.
         affected_gates: set[Gate] = set()
         for other_gate in direct_overlaps:
-            if G.has_node(other_gate):
-                affected_gates.update(nx.node_connected_component(G, other_gate))
+            if og.has_node(other_gate):
+                affected_gates.update(nx.node_connected_component(og, other_gate))
             else:
-                raise NotImplementedError(f"Gate {other_gate} not exists in the graph!")
+                msg = f"Gate {other_gate} not exists in the graph!"
+                raise NotImplementedError(msg)
 
-        H = G.subgraph(affected_gates).copy()  # copy only affected part
-        H.add_node(candidate_gate, route_info=route_info, is_candidate=True) # add candidate
+        h = og.subgraph(affected_gates).copy()  # copy only affected part
+        h.add_node(candidate_gate, route_info=route_info, is_candidate=True)  # add candidate
 
         # Add candidate overlap edges.
         for other_gate, overlap_nodes in direct_overlaps.items():
-            H.add_edge(
+            h.add_edge(
                 candidate_gate,
                 other_gate,
                 overlap_nodes=set(overlap_nodes),
                 num_overlap=len(overlap_nodes),
                 is_candidate_edge=True,
             )
-       
-        return H
-    
+
+        return h
+
     def one_cut_coloring(self, local_og: nx.Graph) -> tuple[bool, dict[Gate, RouteInfo] | None, str]:
-        """
-        Find the one-cut coloring of a single overlap component.
+        """Find the one-cut coloring of a single overlap component.
 
         Two-phase model: each path is split at ancilla position into a first part (phase 1)
         and a second part (phase 2). All first parts must be pairwise node-disjoint and
-        all second parts pairwise node-disjoint. 
+        all second parts pairwise node-disjoint.
 
         The routine re-solves the whole component: it may re-assign the ancilla_idx and
         first_part of already committed paths as well as the new candidate. On success
@@ -503,7 +496,7 @@ class BasicRouter:
         gates = list(local_og.nodes)
         route_infos = {g: local_og.nodes[g]["route_info"] for g in gates}
 
-        # reject if any grid node shared by >= 3 paths 
+        # reject if any grid node shared by >= 3 paths
         node_count: dict[pos, int] = defaultdict(int)
         for gt in gates:
             for node in route_infos[gt].path:
@@ -512,27 +505,25 @@ class BasicRouter:
             return False, None, "A grid node is shared by >= 3 paths."
 
         # build each gate's overlap blocks from the component's edges.
-        idx_of = {
-            g: {node: i for i, node in enumerate(route_infos[g].path)} for g in gates
-        }
+        idx_of = {g: {node: i for i, node in enumerate(route_infos[g].path)} for g in gates}
         blocks_by_gate: dict[Gate, list[dict]] = {g: [] for g in gates}
 
         for g, h in local_og.edges:
             overlap_nodes = local_og[g][h].get("overlap_nodes")
             if not overlap_nodes:
                 return False, None, f"Edge {g}-{h} carries no overlap_nodes."
-            
-            ig = sorted(idx_of[g][n] for n in overlap_nodes) # index of overlap_nodes in g 
-            ih = sorted(idx_of[h][n] for n in overlap_nodes) # index of overlap_nodes in h 
+
+            ig = sorted(idx_of[g][n] for n in overlap_nodes)  # index of overlap_nodes in g
+            ih = sorted(idx_of[h][n] for n in overlap_nodes)  # index of overlap_nodes in h
             if not self.is_consecutive(ig) or not self.is_consecutive(ih):
                 return (False, None, f"Overlap between {g} and {h} is not a single consecutive block.")
             # this route overlaps neighbor h from index start to index end
             blocks_by_gate[g].append({"start": ig[0], "end": ig[-1], "neighbor": h})
             blocks_by_gate[h].append({"start": ih[0], "end": ih[-1], "neighbor": g})
 
-        # sort the overlap blocks with start 
+        # sort the overlap blocks with start
         for g in gates:
-            blocks_by_gate[g].sort(key = lambda b: b["start"])
+            blocks_by_gate[g].sort(key=operator.itemgetter("start"))
 
         # enumerate placement options for every gate(ancilla region x first_part)
         options_by_gate: dict[Gate, list[dict]] = {}
@@ -545,15 +536,21 @@ class BasicRouter:
                 if lo > hi:
                     continue  # no room for an ancilla in this gap
                 for first_part in ("control", "target"):
-                    # decide whether each overlap block lies on the control side or target side of the ancilla 
+                    # decide whether each overlap block lies on the control side or target side of the ancilla
                     phase_of_block = {
                         b["neighbor"]: self.block_phase(
-                            "control" if bi < region else "target", first_part,
+                            "control" if bi < region else "target",
+                            first_part,
                         )
                         for bi, b in enumerate(blocks)
                     }
-                    gate_options.append({"lo": lo, "hi": hi, "first_part": first_part, "phase_of_block": phase_of_block})
-            
+                    gate_options.append({
+                        "lo": lo,
+                        "hi": hi,
+                        "first_part": first_part,
+                        "phase_of_block": phase_of_block,
+                    })
+
             if not gate_options:
                 return False, None, f"No room to place an ancilla on gate {g}."
             options_by_gate[g] = gate_options
@@ -563,15 +560,14 @@ class BasicRouter:
 
         def consistent(g: Gate, opt: dict) -> bool:
             for h, h_opt in chosen.items():
-                if local_og.has_edge(g, h):
-                    # shared node cannot be routed in the same phase 
-                    if opt["phase_of_block"][h] == h_opt["phase_of_block"][g]:
-                        return False
+                # shared node cannot be routed in the same phase
+                if local_og.has_edge(g, h) and opt["phase_of_block"][h] == h_opt["phase_of_block"][g]:
+                    return False
             return True
-        
-        #choosing an option for gates[i], the gates before i have already been assigned.
+
+        # choosing an option for gates[i], the gates before i have already been assigned.
         def backtrack(i: int) -> bool:
-            if i == len(gates): # done
+            if i == len(gates):  # done
                 return True
             g = gates[i]
             for opt in options_by_gate[g]:
@@ -579,7 +575,7 @@ class BasicRouter:
                     chosen[g] = opt
                     if backtrack(i + 1):
                         return True
-                    del chosen[g] # undo the choice if fails
+                    del chosen[g]  # undo the choice if fails
             return False
 
         if not backtrack(0):
@@ -588,8 +584,8 @@ class BasicRouter:
         # final choice for gates in local overlap graph
         updated: dict[Gate, RouteInfo] = {}
         for g in gates:
-            opt = chosen[g] # choice option
-            ancilla_idx = random.randint(opt["lo"], opt["hi"])
+            opt = chosen[g]  # choice option
+            ancilla_idx = random.randint(opt["lo"], opt["hi"])  # ruff:ignore[suspicious-non-cryptographic-random-usage]
             updated[g] = replace(
                 route_infos[g],
                 ancilla_idx=ancilla_idx,
@@ -598,63 +594,65 @@ class BasicRouter:
 
         return True, updated, f"Valid strict_k assignment for {len(gates)} paths."
 
-    def find_fine_grained_vdp(self, layer_idx: int, layer: list[Gate], logical_pos: None | list[pos], factory_times: dict[pos, int], max_overlap: int = 5 
+    def find_fine_grained_vdp(
+        self,
+        layer_idx: int,
+        layer: Sequence[Gate],
+        logical_pos: list[pos] | None,
+        factory_times: dict[pos, int],  # ruff:ignore[unused-method-argument]
+        max_overlap: int = 5,
     ) -> list[Gate]:
-            
-        paths_current_layer = [] 
-        gates_current_layer = layer.copy()
+        """Find fine grained VDP."""
+        paths_current_layer = []
+        gates_current_layer = list(layer)
         remainder_terminal_pairs = []
         for gate in gates_current_layer:
+            control, target = cast("tuple[pos, pos]", gate)
             g_temp = self.g.copy()
             nodes_to_remove = [
-                x for x in (self.logical_pos if logical_pos is None else logical_pos)
-                if x != gate[0] and x != gate[1]
+                x for x in (self.logical_pos if logical_pos is None else logical_pos) if x not in {control, target}
             ]
             g_temp.remove_nodes_from(nodes_to_remove)
 
             try:
-                path = self.valid_path_method()(g_temp, gate[0], gate[1])
+                path = self.valid_path_method()(g_temp, control, target)
             except nx.NetworkXNoPath:
                 remainder_terminal_pairs.append(gate)
                 continue
-            
+
             route_info = self.build_route_info(gate, path, self.default_ancilla_idx(path), "control")
             if paths_current_layer:
                 local_og = self.local_overlap_graph(layer_idx, route_info)
                 n = local_og.number_of_nodes()
-                if n == 1: # no overlap with any committed route in this layer
+                if n == 1:  # no overlap with any committed route in this layer
                     paths_current_layer.append(path)
                     self.commit_route(layer_idx, route_info)
                     continue
-                
+
                 within_cap = n <= max_overlap
                 if within_cap:
-                    valid, updated, reason = self.one_cut_coloring(local_og)
+                    valid, updated, _reason = self.one_cut_coloring(local_og)
                 else:
-                    valid, updated, reason = (False, None, f"Component size {n} exceeds.")
+                    valid, updated, _reason = (False, None, f"Component size {n} exceeds.")
 
-                if valid:
+                if valid and updated is not None:
                     self.commit_component(layer_idx, route_info.gate, updated)
                     paths_current_layer.append(path)
                     continue
 
-                # Alternative route: re-route using unoccupied nodes 
-                nodes_occupied = [
-                    node
-                    for old_path in paths_current_layer
-                    for node in old_path
-                ]
+                # Alternative route: re-route using unoccupied nodes
+                nodes_occupied = [node for old_path in paths_current_layer for node in old_path]
                 g_temp.remove_nodes_from(nodes_occupied)
                 try:
-                    alt_path = self.valid_path_method()(g_temp, gate[0], gate[1]) # find an alternative path
+                    alt_path = self.valid_path_method()(g_temp, control, target)  # find an alternative path
                     alt_info = self.build_route_info(gate, alt_path, self.default_ancilla_idx(alt_path), "control")
                     paths_current_layer.append(alt_path)
                     self.commit_route(layer_idx, alt_info)
                 except nx.NetworkXNoPath:
-                    #logger.info(
+                    # logger.info(
                     #    f"No path found for gate {gate}"
-                    #)
-                    remainder_terminal_pairs.append(gate)                
+                    # )
+                    remainder_terminal_pairs.append(gate)
             else:
                 paths_current_layer.append(path)
                 self.commit_route(layer_idx, route_info)
@@ -662,21 +660,18 @@ class BasicRouter:
         # The layer's routing is final here: store each route's allowed steiner T-junction region for later use
         node_to_gates = self.node_to_gates_by_layer[layer_idx]
         for gate, route_info in self.routes_by_layer[layer_idx].items():
-            other_nodes = {
-                node
-                for node, gates in node_to_gates.items()
-                if gates - {gate}
-            }
-            route_info.junction_lo, route_info.junction_hi = self.t_junction_bounds(route_info, other_nodes)    
+            other_nodes = {node for node, gates in node_to_gates.items() if gates - {gate}}
+            route_info.junction_lo, route_info.junction_hi = self.t_junction_bounds(route_info, other_nodes)
 
         return remainder_terminal_pairs
 
     def commit_component(self, layer_idx: int, candidate_gate: Gate, updated: dict[Gate, RouteInfo]) -> None:
-        """
-        Commit a validated overlap component. The existing routes only change ancilla index and first part (paths remain unchanged),
+        """Commit a validated overlap component.
+
+        The existing routes only change ancilla index and first part (paths remain unchanged),
         while the new candidate is fully committed via `commit_route`.
         """
-        # info (ancilla/first part) update for existing routes 
+        # info (ancilla/first part) update for existing routes
         for gate, info in updated.items():
             if gate == candidate_gate:
                 continue
@@ -687,31 +682,29 @@ class BasicRouter:
         self.commit_route(layer_idx, updated[candidate_gate])
 
     def commit_route(self, layer_idx: int, route_info: RouteInfo) -> None:
-        """
-        commit a valid new route
-        """
-        gate = route_info.gate 
+        """Commit a valid new route."""
+        gate = route_info.gate
         node_to_gates = self.node_to_gates_by_layer[layer_idx]
-        self.routes_by_layer[layer_idx][gate] = route_info # store route
+        self.routes_by_layer[layer_idx][gate] = route_info  # store route
 
-        G = self.overlap_graphs[layer_idx]
-        G.add_node(gate, route_info=route_info) # add node 
-        
+        og = self.overlap_graphs[layer_idx]
+        og.add_node(gate, route_info=route_info)  # add node
+
         for node in set(route_info.path):
-            # all gates crossing `node` 
-            existing_gates = node_to_gates[node] # set[Gate]
+            # all gates crossing `node`
+            existing_gates = node_to_gates[node]  # set[Gate]
             for other_gate in existing_gates:
                 if other_gate == gate:
-                    continue      
-                if self.overlap_graphs[layer_idx].has_edge(gate, other_gate): # overlaps
-                    G[gate][other_gate]["overlap_nodes"].add(node)
-                    G[gate][other_gate]["num_overlap"] = len(G[gate][other_gate]["overlap_nodes"])
+                    continue
+                if self.overlap_graphs[layer_idx].has_edge(gate, other_gate):  # overlaps
+                    og[gate][other_gate]["overlap_nodes"].add(node)
+                    og[gate][other_gate]["num_overlap"] = len(og[gate][other_gate]["overlap_nodes"])
                 else:
-                    G.add_edge(gate, other_gate, overlap_nodes={node}, num_overlap=1)          
-            existing_gates.add(gate) #update node_to_gates
-        
-        #print("updated overlap graph: ", G)
-    
+                    og.add_edge(gate, other_gate, overlap_nodes={node}, num_overlap=1)
+            existing_gates.add(gate)  # update node_to_gates
+
+        # print("updated overlap graph: ", G)
+
     def push_remainder_into_layers(
         self,
         layers: list[Sequence[Gate]],
@@ -864,16 +857,16 @@ class BasicRouter:
         return vdp_layers, factory_times_temp
 
     def find_total_fine_grained_vdp_dyn(
-        self, 
-        layers: list[Sequence[Gate]], 
-        logical_pos: list[pos], 
-        factory_times: dict[pos, int], 
-        max_overlap: int, 
-        layout: dict[int, pos], 
+        self,
+        layers: list[Sequence[Gate]],
+        logical_pos: list[pos],
+        factory_times: dict[pos, int],
+        max_overlap: int,
+        layout: dict[int, pos],
         testing: bool = False,
-    ):
-        """
-        `max_overlap`: int
+    ) -> tuple[list[VdpDict] | None, None]:
+        """`max_overlap`: int.
+
             only used for overlap_type="strict_k": the largest overlap component allowed.
             Ignored for "strict2", which is fixed at 2 by definition.
 
@@ -881,14 +874,15 @@ class BasicRouter:
         {gate: path} dicts ordered by layer index.
         """
         if self.use_dag and layout is None:
-            raise ValueError("If self.use_dag=True, layout must be provided.")
+            msg = "If self.use_dag=True, layout must be provided."
+            raise ValueError(msg)
 
         # Optional but recommended: clear previous fine-grained routing state
         self.routes_by_layer.clear()
         self.overlap_graphs.clear()
         self.node_to_gates_by_layer.clear()
 
-        remaining_layers = [layer.copy() for layer in layers]
+        remaining_layers: list[Sequence[Gate]] = [list(layer) for layer in layers]
         terminal_pairs = []
         for layer in layers:
             terminal_pairs += layer
@@ -910,14 +904,13 @@ class BasicRouter:
         stuck_counter = 0
 
         while remaining_layers:
-            if self.use_dag:
-                current_layer = dag_helper.extract_layer_from_dag(dag, layout, 0)
-            else:
-                current_layer = remaining_layers[0]
-                
-            terminal_pairs_remainder = self.find_fine_grained_vdp(fine_layer_idx, current_layer, logical_pos, factory_times, max_overlap)
+            current_layer = dag_helper.extract_layer_from_dag(dag, layout, 0) if self.use_dag else remaining_layers[0]
 
-            # progress check, bail after enough consecutive stalls 
+            terminal_pairs_remainder = self.find_fine_grained_vdp(
+                fine_layer_idx, current_layer, logical_pos, factory_times, max_overlap
+            )
+
+            # progress check, bail after enough consecutive stalls
             if len(terminal_pairs_remainder) >= len(current_layer):
                 stuck_counter += 1
             if stuck_counter > 10 * self.t:
@@ -938,9 +931,8 @@ class BasicRouter:
                 )
             fine_layer_idx += 1
 
-        fg_layers = [
-            {gate: list(ri.path) for gate, ri in self.routes_by_layer[i].items()}
-            for i in sorted(self.routes_by_layer)
+        fg_layers: list[VdpDict] = [
+            {gate: list(ri.path) for gate, ri in self.routes_by_layer[i].items()} for i in sorted(self.routes_by_layer)
         ]
 
         if testing:
@@ -956,10 +948,10 @@ class BasicRouter:
             if tst.check_phase_disjoint_fg(self.routes_by_layer):
                 logger.info("no duplicates found in fine-grained routing (:")
             else:
-                logger.info("Problematic! Nodes are used by two paths")   
+                logger.info("Problematic! Nodes are used by two paths")
 
         return fg_layers, None
-    
+
     def count_crossings(self, layers: Sequence[Sequence[tuple[pos, pos]]], logical_pos_temp: list[pos]) -> int:
         """Heuristic energy function to minimize.
 
@@ -1122,7 +1114,7 @@ class TeleportationRouter(BasicRouter):
         steiner_init_type: str,
         layers: list[Sequence[Gate]] | None = None,
         k_lookahead: int | None = None,
-        fine_routes = None,
+        fine_routes: dict[Gate, RouteInfo] | None = None,
     ) -> SteinerType:
         """Initialize a random steiner tree per path which are non-overlapping.
 
@@ -1184,10 +1176,13 @@ class TeleportationRouter(BasicRouter):
                 lo = getattr(ri, "junction_lo", None)
                 hi = getattr(ri, "junction_hi", None)
                 if lo is None or hi is None:
-                    raise NotImplementedError("junction lower/upper bound is empty")
+                    msg_0 = "junction lower/upper bound is empty"
+                    raise NotImplementedError(msg_0)
                 junction_candidates = pathcopy[lo : hi + 1]
             else:
-                junction_candidates = pathcopy[1:-1]  # remove last and first node from the list because those are logical data patches
+                junction_candidates = pathcopy[
+                    1:-1
+                ]  # remove last and first node from the list because those are logical data patches
             random.shuffle(junction_candidates)
             if self.fine_allowed_junctions is not None:
                 self.fine_allowed_junctions[key] = set(junction_candidates)
@@ -1197,11 +1192,7 @@ class TeleportationRouter(BasicRouter):
                     # determine all reachable nodes from that chosen node
                     current_path_nodes = [node for node in path if node != node_on_path]
                     g_temp_temp.remove_nodes_from(current_path_nodes)
-                    reachable_nodes = list(
-                        nx.single_source_shortest_path_length(
-                            g_temp_temp, node_on_path
-                        ).keys()
-                    )
+                    reachable_nodes = list(nx.single_source_shortest_path_length(g_temp_temp, node_on_path).keys())
                     if reachable_nodes:
                         flag = True
                         break  # if there is a reachable node found, take it, otherwise try another random node
@@ -1248,9 +1239,10 @@ class TeleportationRouter(BasicRouter):
         For each tree in steiner_dct a new location of the 3rd terminal is updated randomly.
         """
 
-        def allowed_starts(key_tree, path1):
-            """
-            Candidate T-junction nodes.  In fine-grained mode
+        def allowed_starts(key_tree: tuple[pos, ...], path1: list[pos]) -> list[pos]:
+            """Candidate T-junction nodes.
+
+            In fine-grained mode
             the junction may only sit in the committed ancilla's region.
             """
             allowed = None
@@ -1260,7 +1252,6 @@ class TeleportationRouter(BasicRouter):
                 return path1[1:-1]
             return [n for n in path1[1:-1] if n in allowed]
 
-        
         if self.logical_pos_temp is None:
             msg = "Need to initialize logical pos temp properly in a summarizing method."  # pragma: no cover
             raise RuntimeError(msg)
@@ -1437,13 +1428,23 @@ class TeleportationRouter(BasicRouter):
                 result.append(new if item == old else item)
         return result
 
-    def calculate_cost(self, metric, vdp_type, max_overlap, layers, logical_pos, factory_times, layout):
+    def calculate_cost(
+        self,
+        metric: str,
+        vdp_type: str,
+        max_overlap: int | None,
+        layers: list[Sequence[Gate]],
+        logical_pos: list[pos],
+        factory_times: dict[pos, int],
+        layout: dict[int, pos],
+    ) -> tuple[int, list[VdpDict] | None]:
+        """Compute the cost of routing with the given metric."""
         cost = 0
         schedule = None  # only the "exact" metric produces one
         if metric == "crossing":
-                cost = self.count_crossings(
-                    layers, logical_pos
-                )  # overwrite this in the upcoming loop
+            cost = self.count_crossings(
+                cast("list[Sequence[tuple[pos, pos]]]", layers), logical_pos
+            )  # overwrite this in the upcoming loop
         elif metric == "exact":
             if vdp_type == "coarse":
                 schedule, _ = self.find_total_vdp_layers_dyn(
@@ -1453,8 +1454,9 @@ class TeleportationRouter(BasicRouter):
                     layout,
                 )  # initially the self.logical pos can be used. later you need a logical_pos outside of self
             elif vdp_type == "fine":
-                # In find_total_fine_grained_vdp_dyn, we clear these variables and rebuilt them, hence first saved 
-                _saved = (
+                assert max_overlap is not None, "max_overlap is required for vdp_type='fine'."
+                # In find_total_fine_grained_vdp_dyn, we clear these variables and rebuilt them, hence first saved
+                saved = (
                     self.routes_by_layer,
                     self.overlap_graphs,
                     self.node_to_gates_by_layer,
@@ -1469,21 +1471,20 @@ class TeleportationRouter(BasicRouter):
                         factory_times,
                         max_overlap,
                         layout,
-                        testing = False,
+                        testing=False,
                     )
                 finally:
-                    (self.routes_by_layer, self.overlap_graphs, self.node_to_gates_by_layer) = _saved
+                    (self.routes_by_layer, self.overlap_graphs, self.node_to_gates_by_layer) = saved
             else:
-                raise NotImplementedError("Other vdp types are not implemented yet.")
+                msg = "Other vdp types are not implemented yet."
+                raise NotImplementedError(msg)
 
-            if schedule is not None:
-                cost = len(schedule)
-            else:
-                cost = lock_penalty
+            cost = len(schedule) if schedule is not None else lock_penalty
         else:
-            raise NotImplementedError("Other metrics than crossing and exact not implemented yet.")
+            msg = "Other metrics than crossing and exact not implemented yet."
+            raise NotImplementedError(msg)
         return cost, schedule
-    
+
     def run_annealing(
         self,
         next_layers: list[Sequence[Gate]],
@@ -1496,8 +1497,8 @@ class TeleportationRouter(BasicRouter):
         radius: int,
         vdp_dict: VdpDict,
         layout: dict[int, pos],
-        vdp_type: str = "coarse", 
-        fine_routes = None, 
+        vdp_type: str = "coarse",
+        fine_routes: dict[Gate, RouteInfo] | None = None,
         max_overlap: int | None = None,
     ) -> tuple[
         SteinerType | None,  # best_steiner
@@ -1521,6 +1522,9 @@ class TeleportationRouter(BasicRouter):
             radius: number of edges within which one can choose a new ancilla position
             vdp_dict: routing of current layer
             layout: layout.
+            vdp_type: Either "coarse" or "fine".
+            fine_routes: Committed fine-grained routes of the current layer. Required for `vdp_type="fine"`.
+            max_overlap: Largest number of routes allowed in one overlap component. Required for `vdp_type="fine"`.
 
         Returns:
             best_steiner
@@ -1541,8 +1545,16 @@ class TeleportationRouter(BasicRouter):
             raise ValueError(msg)
 
         self.logical_pos_temp: list[pos] = self.logical_pos.copy()
-        cost, schedule = self.calculate_cost(self.metric, vdp_type, max_overlap, next_layers[:k_lookahead], self.logical_pos_temp, factory_times_copy, layout)
-        
+        cost, schedule = self.calculate_cost(
+            self.metric,
+            vdp_type,
+            max_overlap,
+            next_layers[:k_lookahead],
+            self.logical_pos_temp,
+            factory_times_copy,
+            layout,
+        )
+
         steiner_dct = init_steiner_dct.copy()
         best_steiner: SteinerType | None = steiner_dct
         best_cost = cost
@@ -1580,10 +1592,11 @@ class TeleportationRouter(BasicRouter):
                     # randomly choose whether we shift control to ancilla or target to ancilla
                     # randomly choose whether we shift control to ancilla or target to ancilla
                     if vdp_type == "coarse":
-                        move_type = random.choice(["target", "control"]) # ruff:ignore[suspicious-non-cryptographic-random-usage]
-                    # in fine-grained method, we don't have choice for the move type 
+                        move_type = random.choice(["target", "control"])  # ruff:ignore[suspicious-non-cryptographic-random-usage]
+                    # in fine-grained method, we don't have choice for the move type
                     elif vdp_type == "fine":
-                        ri = fine_routes[(a, b)]
+                        assert fine_routes is not None, "fine_routes is required for vdp_type='fine'."
+                        ri = fine_routes[a, b]
                         fp = getattr(ri, "first_part", None)
                         move_type = "target" if fp == "control" else "control"
                     move_type_lst_temp.update({(a, b, terminal): move_type})
@@ -1618,7 +1631,9 @@ class TeleportationRouter(BasicRouter):
                     raise RuntimeError(msg)
             # 2. compute the crossing metric for next_layer
             layers_for_metric = next_layers_copy[:k_lookahead]
-            candidate_cost, schedule = self.calculate_cost(self.metric,  vdp_type, max_overlap, layers_for_metric, logical_pos_temp, factory_times_copy, layout_mod)
+            candidate_cost, schedule = self.calculate_cost(
+                self.metric, vdp_type, max_overlap, layers_for_metric, logical_pos_temp, factory_times_copy, layout_mod
+            )
 
             # except ValueError:
             #    continue #skip if some config locks the qubits such that you cannot even evaluate count crossings
@@ -1949,7 +1964,7 @@ class TeleportationRouter(BasicRouter):
             reduce_steiner: Recommended to use True. Decides whether the trees are reduced again (True), such that possibly useless movements are removed. Using False may reduce rutnime however.
             idle_move_type: Recommended to use `later`. asap: moving back is done as frequent as possible. this may destroy however structure of the predicted routing from the steiner search. later: means that moving back is only done when the steiner search is done. if a locking occurs, extra layers with moving back are necessary, but no moving back during the routing of the k_lookahead layers with jump_harvesting = True.
             reduce_init_steiner: Defaults to False and is recommended not to be changed.
-            vdp_type: type of vdp subroutine used, default is coarse-grained. 
+            vdp_type: type of vdp subroutine used, default is coarse-grained.
             max_overlap: the threshold of the number of overlaps allowed in a single component in fine-grained method, None for coarse-grained method.
             stimtest: If True, at the end of the computation the schedule is sanity checked. Defaults to False but recommended to use.
 
@@ -1960,12 +1975,13 @@ class TeleportationRouter(BasicRouter):
             msg = "`move_idle_type` must be `asap` or `later`"  # pragma: no cover
             raise ValueError(msg)
         if vdp_type not in {"coarse", "fine"}:
-            raise ValueError("`vdp_type` must be `coarse` or `fine`")
-        
+            msg_0 = "`vdp_type` must be `coarse` or `fine`"
+            raise ValueError(msg_0)
+
         fine_layer_idx = 0
         self.fine_allowed_junctions = None
         if vdp_type == "fine":
-            # clear 
+            # clear
             self.routes_by_layer.clear()
             self.overlap_graphs.clear()
             self.node_to_gates_by_layer.clear()
@@ -2012,6 +2028,7 @@ class TeleportationRouter(BasicRouter):
                 )
                 fine_routes = None
             elif vdp_type == "fine":
+                assert max_overlap is not None, "max_overlap is required for vdp_type='fine'."
                 terminal_pairs_remainder = self.find_fine_grained_vdp(
                     fine_layer_idx,
                     layers[0],
@@ -2020,7 +2037,7 @@ class TeleportationRouter(BasicRouter):
                     max_overlap,
                 )
                 fine_routes = dict(self.routes_by_layer[fine_layer_idx])
-                vdp_dict = {gate: list(ri.path) for gate, ri in fine_routes.items()}
+                vdp_dict = cast("VdpDict", {gate: list(ri.path) for gate, ri in fine_routes.items()})
                 fine_layer_idx += 1
 
             schedule_temp["fine_routes"] = fine_routes
@@ -2095,11 +2112,7 @@ class TeleportationRouter(BasicRouter):
             # find optimal steiner tree(s) for current layer
             if reduce_init_steiner:
                 steiner_dct = self.initialize_steiner(
-                    vdp_dict,
-                    steiner_init_type,
-                    layers=layers,
-                    k_lookahead=k_lookahead,
-                    fine_routes = fine_routes
+                    vdp_dict, steiner_init_type, layers=layers, k_lookahead=k_lookahead, fine_routes=fine_routes
                 )
                 if len(steiner_dct) == 0:
                     best_steiner_init = None
@@ -2123,19 +2136,15 @@ class TeleportationRouter(BasicRouter):
                         radius=radius,
                         vdp_dict=cast("VdpDict", schedule_temp["vdp_dict"]),
                         layout=layout,
-                        vdp_type = vdp_type, 
-                        fine_routes = fine_routes, 
-                        max_overlap = max_overlap,
+                        vdp_type=vdp_type,
+                        fine_routes=fine_routes,
+                        max_overlap=max_overlap,
                     )
                     # store improvement history
                     improvement_history.append((best_cost, cost_history[0]))
             else:
                 steiner_dct = self.initialize_steiner(
-                    vdp_dict,
-                    steiner_init_type,
-                    layers=None,
-                    k_lookahead=None,
-                    fine_routes = fine_routes 
+                    vdp_dict, steiner_init_type, layers=None, k_lookahead=None, fine_routes=fine_routes
                 )
                 (
                     best_steiner_init,
@@ -2156,9 +2165,9 @@ class TeleportationRouter(BasicRouter):
                     radius=radius,
                     vdp_dict=cast("VdpDict", schedule_temp["vdp_dict"]),
                     layout=layout,
-                    vdp_type = vdp_type, 
-                    fine_routes = fine_routes, 
-                    max_overlap = max_overlap,
+                    vdp_type=vdp_type,
+                    fine_routes=fine_routes,
+                    max_overlap=max_overlap,
                 )
                 # store improvement history
                 improvement_history.append((best_cost, cost_history[0]))
@@ -2346,6 +2355,7 @@ class TeleportationRouter(BasicRouter):
                         )
                         fine_routes = None
                     elif vdp_type == "fine":
+                        assert max_overlap is not None, "max_overlap is required for vdp_type='fine'."
                         terminal_pairs_remainder = self.find_fine_grained_vdp(
                             fine_layer_idx,
                             layers_k[0],
@@ -2354,7 +2364,7 @@ class TeleportationRouter(BasicRouter):
                             max_overlap,
                         )
                         fine_routes = dict(self.routes_by_layer[fine_layer_idx])
-                        vdp_dict = {gate: list(ri.path) for gate, ri in fine_routes.items()}
+                        vdp_dict = cast("VdpDict", {gate: list(ri.path) for gate, ri in fine_routes.items()})
                         fine_layer_idx += 1
 
                     schedule_temp["fine_routes"] = fine_routes
@@ -2484,12 +2494,12 @@ class TeleportationRouter(BasicRouter):
         if tst.check_path_on_logical(schedule):
             logger.info("No path/tree is placed on a logical pos. All good(:")
 
-        # fine-grained test 
+        # fine-grained test
         if vdp_type == "fine":
-            # check that two-phase routing is valid 
+            # check that two-phase routing is valid
             if tst.check_phase_disjoint_fg(self.routes_by_layer):
                 logger.info("No shared-phase nodes in any fine-grained layer - all good(:")
-        # coarse-grained test 
+        # coarse-grained test
         elif vdp_type == "coarse":
             if tst.check_duplicate_nodes_per_layer(schedule):
                 logger.info("No duplicates found in any layer of the schedule - hence all good(:")
