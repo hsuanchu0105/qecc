@@ -446,9 +446,6 @@ class BasicRouter:
 
     def local_overlap_graph(self, layer_idx: int, route_info: RouteInfo) -> nx.Graph:
         """Build the local overlap graph containing the candidate route."""
-        # print("local overlap function check: ")
-        # print("Gate: ", route_info.gate)
-
         og = self.overlap_graphs[layer_idx]
         direct_overlaps = self.direct_overlaps(layer_idx, route_info)  # dict[gate, overlap_nodes]
         candidate_gate = route_info.gate
@@ -648,10 +645,7 @@ class BasicRouter:
                     alt_info = self.build_route_info(gate, alt_path, self.default_ancilla_idx(alt_path), "control")
                     paths_current_layer.append(alt_path)
                     self.commit_route(layer_idx, alt_info)
-                except nx.NetworkXNoPath:
-                    # logger.info(
-                    #    f"No path found for gate {gate}"
-                    # )
+                except nx.NetworkXNoPath:  # no path found
                     remainder_terminal_pairs.append(gate)
             else:
                 paths_current_layer.append(path)
@@ -702,8 +696,6 @@ class BasicRouter:
                 else:
                     og.add_edge(gate, other_gate, overlap_nodes={node}, num_overlap=1)
             existing_gates.add(gate)  # update node_to_gates
-
-        # print("updated overlap graph: ", G)
 
     def push_remainder_into_layers(
         self,
